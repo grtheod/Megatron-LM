@@ -516,3 +516,237 @@ if HAVE_HYBRIDEP:
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+
+
+try:
+    from .nccl_ep_backend import (
+        NCCLEPBuffer,
+        NCCL_EP_ALGO_HIGH_THROUGHPUT,
+        HAVE_NCCL_EP,
+    )
+except ImportError:
+    HAVE_NCCL_EP = False
+    NCCLEPBuffer = None
+    NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
+
+_nccl_ep_buffer = None
+_nccl_ep_num_qp_per_rank = 20  # Default queue pairs per rank
+_nccl_ep_num_channels = 10  # Default communication channels
+
+
+def set_nccl_ep_num_qp_per_rank(num_qp: int) -> None:
+    """Sets the number of queue pairs per rank for NCCL EP. Must be called before buffer init."""
+    global _nccl_ep_num_qp_per_rank
+    _nccl_ep_num_qp_per_rank = num_qp
+
+
+def set_nccl_ep_num_channels(num_channels: int) -> None:
+    """Sets the number of communication channels for NCCL EP. Must be called before buffer init."""
+    global _nccl_ep_num_channels
+    _nccl_ep_num_channels = num_channels
+
+
+def init_nccl_ep_buffer(
+    group: torch.distributed.ProcessGroup,
+    num_experts: int,
+    hidden_dim: int,
+    max_tokens_per_rank: int,
+    algorithm: int = NCCL_EP_ALGO_HIGH_THROUGHPUT if HAVE_NCCL_EP else 1,
+) -> None:
+    """Initialize the NCCL EP buffer for MoE communication.
+
+    Args:
+        group (torch.distributed.ProcessGroup): Process group for NCCL EP all-to-all.
+        num_experts (int): Total number of experts.
+        hidden_dim (int): Hidden dimension of the input tensor.
+        max_tokens_per_rank (int): Maximum tokens per rank. Must be > 0 for HIGH_THROUGHPUT
+            mode; dynamic sizing (0) is not supported.
+        algorithm (int): NCCL EP algorithm (LOW_LATENCY or HIGH_THROUGHPUT).
+    """
+    global _nccl_ep_buffer
+    _nccl_ep_buffer = NCCLEPBuffer(
+        group=group,
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        max_tokens_per_rank=max_tokens_per_rank,
+        algorithm=algorithm,
+        num_qp_per_rank=_nccl_ep_num_qp_per_rank,
+        num_channels=_nccl_ep_num_channels,
+    )
+
+
+class NCCLEPDispatch(torch.autograd.Function):
+    """Fused dispatch operation for MoE routing using the NCCL EP backend."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        use_fp8=False,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        max_tokens_per_rank=8192,
+    ):
+        """Forward pass of NCCL EP dispatch."""
+        if _nccl_ep_buffer is None:
+            # Auto-initialize if not already done (max_tokens_per_rank required for HT/internode)
+            hidden_dim = x.shape[-1]
+            init_nccl_ep_buffer(
+                group=group,
+                num_experts=num_experts,
+                hidden_dim=hidden_dim,
+                max_tokens_per_rank=max_tokens_per_rank,
+            )
+
+        recv_x, recv_token_indices, recv_token_probs, handle, after_event = _nccl_ep_buffer.dispatch(
+            x=x,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            use_fp8=use_fp8,
+            previous_event=None,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+
+        tokens_per_expert = _nccl_ep_buffer.get_tokens_per_expert_list()
+
+        # Save context for backward
+        ctx.handle = handle
+        ctx.group = group
+        ctx.num_experts = num_experts
+        ctx.use_fp8 = use_fp8
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        ctx.save_for_backward(token_indices, token_probs)
+
+        tokens_per_expert_tensor = torch.tensor(tokens_per_expert, dtype=torch.long)
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert_tensor, handle)
+
+    @staticmethod
+    def backward(
+        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+    ):
+        """Backward pass of NCCL EP dispatch."""
+        token_indices, token_probs = ctx.saved_tensors
+
+        if _nccl_ep_buffer is None:
+            raise RuntimeError("NCCL EP buffer not initialized.")
+
+        combined_grad, grad_token_probs_out, after_event = _nccl_ep_buffer.combine(
+            x=grad_output.contiguous(),
+            handle=ctx.handle,
+            topk_weights=grad_token_probs.float() if grad_token_probs is not None else None,
+            previous_event=None,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+
+        # Destroy handle - this is the last operation using this handle
+        _nccl_ep_buffer.destroy_handle(ctx.handle)
+
+        # Return gradients for all 9 inputs:
+        # x, token_indices, token_probs, num_experts, group, use_fp8, async_finish, allocate_on_comm_stream, max_tokens_per_rank
+        return combined_grad, None, grad_token_probs_out, None, None, None, None, None, None
+
+
+class NCCLEPCombine(torch.autograd.Function):
+    """Fused combine operation for MoE output combining using the NCCL EP backend."""
+
+    @staticmethod
+    def forward(ctx, x, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Forward pass of NCCL EP combine."""
+        if _nccl_ep_buffer is None:
+            raise RuntimeError("NCCL EP buffer not initialized.")
+
+        combined_x, _, after_event = _nccl_ep_buffer.combine(
+            x=x,
+            handle=handle,
+            previous_event=None,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+        ctx.handle = handle
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, None
+
+    @staticmethod
+    def backward(ctx, grad_output, _):
+        """Backward pass of NCCL EP combine."""
+        if _nccl_ep_buffer is None:
+            raise RuntimeError("NCCL EP buffer not initialized.")
+
+        grad_x, _, _, _, after_event = _nccl_ep_buffer.dispatch(
+            x=grad_output.contiguous(),
+            handle=ctx.handle,
+            topk_weights=None,  # Not needed in cached mode
+            previous_event=None,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+        return grad_x, None, None, None
+
+
+if HAVE_NCCL_EP:
+
+    def nccl_ep_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        use_fp8=False,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        max_tokens_per_rank=8192,
+    ):
+        """Perform NCCL EP dispatch operation if NCCL EP is available.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size]
+            token_indices: Token routing indices [num_tokens, topk]
+            token_probs: Token routing probabilities [num_tokens, topk]
+            num_experts: Number of experts
+            group: Process group
+            use_fp8: Whether to use FP8 precision
+            async_finish: If True, don't sync streams at the end (ignored; sync only)
+            allocate_on_comm_stream: If True, allocate on comm stream (ignored)
+            max_tokens_per_rank: Max tokens per rank for HT/internode
+
+        Returns:
+            Result of NCCLEPDispatch
+        """
+        # NCCL EP backend works in synchronous mode; async args ignored
+        async_finish = False
+        allocate_on_comm_stream = False
+
+        return NCCLEPDispatch.apply(
+            x.contiguous(), token_indices, token_probs, num_experts, group, use_fp8,
+            async_finish, allocate_on_comm_stream, max_tokens_per_rank
+        )
+
+    def nccl_ep_combine(x, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Perform NCCL EP combine operation if NCCL EP is available.
+
+        Args:
+            x: Expert output tensor [num_recv_tokens, hidden]
+            handle: Communication handle from dispatch
+            async_finish: If True, don't sync streams at the end (ignored; sync only)
+            allocate_on_comm_stream: If True, allocate on comm stream (ignored)
+
+        Returns:
+            Result of NCCLEPCombine
+        """
+        # NCCL EP backend works in synchronous mode; async args ignored
+        async_finish = False
+        allocate_on_comm_stream = False
+
+        return NCCLEPCombine.apply(x, handle, async_finish, allocate_on_comm_stream)
+
+else:
+    nccl_ep_dispatch = None
+    nccl_ep_combine = None

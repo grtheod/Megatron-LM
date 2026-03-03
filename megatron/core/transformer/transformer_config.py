@@ -692,9 +692,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
     the MNNVL case."""
 
     moe_per_layer_logging: bool = False
@@ -744,6 +744,20 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
+
+    moe_nccl_ep_num_qp_per_rank: int = 20
+    """Number of queue pairs per rank for NCCL EP. Must satisfy:
+    num_qp >= num_channels or num_qp >= num_sms for internode communication."""
+
+    moe_nccl_ep_num_channels: int = 10
+    """Number of communication channels for NCCL EP. In high throughput mode,
+    num_sms = num_channels * 2. Must be set before buffer initialization."""
+
+    moe_nccl_ep_max_tokens_per_rank: int = 8192
+    """Maximum number of tokens per rank for NCCL EP (HT mode). Required for
+    internode communication; the backend uses it to size RDMA and staging buffers.
+    Should be >= max tokens any rank can send/receive in the EP group (e.g.
+    seq_length * micro_batch_size * ep_size or a conservative upper bound)."""
 
     ##################
     # Context Parallel
@@ -1108,9 +1122,24 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity and (
-                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
-            ):
+            # Validate backend choice
+            valid_backends = ["deepep", "hybridep", "ncclep"]
+            if self.moe_flex_dispatcher_backend not in valid_backends:
+                raise ValueError(
+                    f"Invalid moe_flex_dispatcher_backend: {self.moe_flex_dispatcher_backend}. "
+                    f"Valid options are: {', '.join(valid_backends)}"
+                )
+
+            # Check for deprecated flag conflicts
+            if self.moe_enable_deepep and self.moe_flex_dispatcher_backend != "deepep":
+                raise ValueError(
+                    "moe_enable_deepep is deprecated and conflicts with "
+                    f"moe_flex_dispatcher_backend={self.moe_flex_dispatcher_backend}. "
+                    "Please use --moe-flex-dispatcher-backend=deepep instead."
+                )
+
+            # DeepEP backend does not support padding to capacity
+            if self.moe_pad_expert_input_to_capacity and self.moe_flex_dispatcher_backend == "deepep":
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
